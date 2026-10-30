@@ -1,0 +1,15 @@
+# Participant data never enters this repo - it is public.
+*.csv
+*.xls
+*.xlsx
+*.mat
+data_local/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Outputs
+outputs/

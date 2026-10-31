@@ -177,8 +177,15 @@ def main() -> None:
         if (i + 1) % 500 == 0:
             print(f"  {i + 1}/{args.n_permutations} permutations", flush=True)
 
+    # Inference is on the t-statistic throughout. The permutation null of a raw
+    # coefficient and that of its t co-vary with the cluster-robust SE, so the two
+    # give different p-values for the same term; the lifetime and interval models
+    # are skewed enough for that gap to be large. The t is studentised and so
+    # comparable across the four measures, which is also what max-T requires. The
+    # coefficient-based p is kept beside it for transparency, not for correction.
     rows = [{"term": t, "coef": coefs[t], "t": tvals[t],
-             "perm_p": two_sided_p(coefs[t], null_coef[t]),
+             "perm_p": two_sided_p(tvals[t], null_t[t]),
+             "perm_p_coef": two_sided_p(coefs[t], null_coef[t]),
              "permuted": "age" if t == "entropy_rate|age" else args.predictor}
             for t in coefs]
     table = pd.DataFrame(rows)
@@ -195,6 +202,15 @@ def main() -> None:
     table = table.sort_values("perm_p")
     table.to_csv(args.out_dir / f"terms_{args.predictor}.csv", index=False)
     print(f"wrote terms_{args.predictor}.csv  {table.shape}")
+
+    # The permutation nulls are kept so that any later change to the correction
+    # family or scheme is a re-derivation rather than a refit.
+    np.savez_compressed(args.out_dir / f"nulls_{args.predictor}.npz",
+                        terms=np.array(list(coefs)),
+                        null_t=np.column_stack([null_t[t] for t in coefs]),
+                        null_coef=np.column_stack([null_coef[t] for t in coefs]),
+                        observed_t=np.array([tvals[t] for t in coefs]),
+                        observed_coef=np.array([coefs[t] for t in coefs]))
 
     diag_rows = []
     for metric, diag in diagnostics.items():

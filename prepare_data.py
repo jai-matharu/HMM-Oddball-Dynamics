@@ -1,22 +1,20 @@
-"""Build the tidy analysis tables from the original oddball HMM exports.
+"""Build the tidy analysis tables for the 39-participant analysis sample.
 
-Reads the files in --data-dir (private, never in this repo) and writes three
-CSVs matching the contract used by the RED_MEG analysis package:
+Demographic, cognitive and behavioural variables come from the original
+spreadsheet. Every HMM metric comes from the 39-participant fit in
+Outputs/HMM_Outputs/K7_2, via compute_durations.py (Viterbi path) and
+transitions_from_xi.py (Xi). The spreadsheet's own Entropy/SwitchingRate/MaxFO/
+FO1-7 columns were produced by the earlier 40-participant fit, so they are
+carried through only as *_orig40 for provenance and are not analysis variables.
 
-  subject_level.csv       - one row per subject
-  state_level.csv         - one row per subject x state
-  transition_matrices.csv - one row per subject x from_state x to_state
-
-Subject-level HMM metrics are recomputed from the per-participant transition
-matrices rather than copied from the spreadsheet; the original columns are
-carried through alongside as *_original for comparison.
-
-Pass --durations to fill in the per-state lifetimes and intervals produced by
-compute_durations.py; without it those columns are left empty, since the
-duration files shipped with the original analysis carry no subject index.
+Writes:
+  subject_level.csv       - one row per participant
+  state_level.csv         - one row per participant x state
+  transition_matrices.csv - one row per participant x from_state x to_state
 
 Usage:
-  python prepare_data.py --data-dir <dir> --out-dir <dir> [--durations <csv>]
+  python prepare_data.py --data-dir <original exports> --hmm-dir <tidy_K7_2> \
+      --out-dir <dir> [--threshold 10]
 """
 
 from __future__ import annotations
@@ -28,137 +26,113 @@ import numpy as np
 import pandas as pd
 
 NSTATES = 7
-FS_HZ = 250.0  # T is in samples; every value in Preprocessing_Steps is a multiple of 250
+
+# 99114 is excluded from the analysis sample.
+#
+# The exclusion originates in the dissertation's own HMM_Compute.m, which
+# removes data(32)/T(32) under the comment "Remove participant 99114" and
+# re-fits the HMM on the remaining 39 into Outputs/HMM_Outputs/K7_2. No reason
+# is recorded there. The manuscript attributes it to poor digitisation of the
+# scalp locations giving an inadequate co-registration solution, which the
+# preprocessing records contradict: 99114 has its own T1 with extracted scalp,
+# skull and cortex surfaces (sub-073) and is marked coregistered, beamformed
+# and parcellated, with a beamformed file and a parcellated HMM input on disk.
+#
+# What the data show is a state time course dominated by a single state. In the
+# 40-participant fit 99114 has FO 0.651 in state 1 against a group mean of
+# 0.033, supplying 50% of all state-1 occupancy across the sample, and is the
+# most extreme participant of the 40 on entropy rate (z = -3.50), switching
+# rate (z = -3.38) and max FO (0.651, z = +2.73). Recording length (373,250
+# samples) and age (10.0) are unremarkable.
+EXCLUDED = ("99114",)
 
 
-def stationary_distribution(P: np.ndarray) -> np.ndarray:
-    """Left eigenvector of P for eigenvalue 1, normalised to sum to 1."""
-    eigenvalues, eigenvectors = np.linalg.eig(P.T)
-    mu = np.real(eigenvectors[:, np.argmin(np.abs(eigenvalues - 1.0))])
-    return mu / mu.sum()
-
-
-def entropy_rate(P: np.ndarray, mu: np.ndarray, fs: float | None = None) -> float:
-    """Entropy rate in nats per sample, or per second if fs is given."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        log_P = np.where(P > 0, np.log(P), 0.0)
-    rate = float(np.dot(mu, -np.sum(P * log_P, axis=1)))
-    return rate * fs if fs is not None else rate
-
-
-def load_transition_matrices(path: Path, subject_ids) -> np.ndarray:
-    """Read the 40 x 49 sheet into (nsub, 7, 7).
-
-    The 49 columns are a MATLAB reshape of each 7x7 matrix, so they unflatten
-    in column-major order. Row order matches the spreadsheet row order.
-    """
-    flat = pd.read_excel(path, header=None).dropna(how="all").to_numpy(dtype=float)
-    if flat.shape != (len(subject_ids), NSTATES**2):
-        raise ValueError(f"expected {(len(subject_ids), NSTATES ** 2)} in {path.name}, got {flat.shape}")
-    P = flat.reshape(-1, NSTATES, NSTATES, order="F")
-    rowsums = P.sum(axis=2)
-    if not np.allclose(rowsums, 1.0, atol=1e-6):
-        raise ValueError(f"transition matrices are not row-stochastic (max |rowsum-1| = {np.abs(rowsums - 1).max():.2e})")
-    return P
-
-
-def load_subjects(data_dir: Path) -> pd.DataFrame:
-    """Demographics, cognition, SDQ and SES for the 40 participants with HMM output."""
+def load_behaviour(data_dir: Path) -> pd.DataFrame:
+    """Demographics, cognition, SDQ and SES, as recorded in the spreadsheet."""
     df = pd.read_csv(data_dir / "SESWithImputed_participants_only_40.csv")
     df = df.rename(columns={"RED ID": "subject_id", "MATRIX_Tscore": "matrix_T",
                             "MATRIX_RawScore": "matrix_raw", "Age": "age",
                             "Subjective_SES": "subjective_SES", "Income": "income",
                             "Equivalised_Income_Updated": "equivalised_income"})
+    df["subject_id"] = df["subject_id"].astype(str)
     df["sex"] = df["Gender"].map({"M": 1, "F": 2, 1: 1, 2: 2, 1.0: 1, 2.0: 2})
     if df["sex"].isna().any():
         raise ValueError(f"unmapped Gender values: {sorted(df.loc[df.sex.isna(), 'Gender'].unique())}")
 
-    sdq = {c: c.lower().replace("sdq_", "SDQ_") for c in df.columns if c.startswith("SDQ_")}
-    df = df.rename(columns=sdq)
-    # Standard SDQ composites: the draft's Externalising/Internalising scores.
+    df = df.rename(columns={c: c.lower().replace("sdq_", "SDQ_")
+                            for c in df.columns if c.startswith("SDQ_")})
+    # The draft's Externalising and Internalising scores.
     df["SDQ_externalising"] = df["SDQ_hyperactivity"] + df["SDQ_conduct"]
     df["SDQ_internalising"] = df["SDQ_emotion"] + df["SDQ_peerproblems"]
     return df
 
 
-def load_T(data_dir: Path, subject_ids) -> pd.Series:
-    """Per-participant downsampled timepoint count, keyed by RED ID."""
-    T = pd.read_csv(data_dir / "T_candidate_40_with_RED_ID.csv")
-    T = T.rename(columns={"RED_ID": "subject_id", "Time_ds_candidate": "T_samples"})
-    T["subject_id"] = T["subject_id"].astype(str)
-    return T.set_index("subject_id")["T_samples"].reindex([str(s) for s in subject_ids]).to_numpy()
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", required=True, type=Path)
+    ap.add_argument("--data-dir", required=True, type=Path,
+                    help="directory holding the original exports")
+    ap.add_argument("--hmm-dir", required=True, type=Path,
+                    help="directory holding the K7_2 derived metrics")
     ap.add_argument("--out-dir", required=True, type=Path)
-    ap.add_argument("--durations", type=Path,
-                    help="durations csv from compute_durations.py")
+    ap.add_argument("--threshold", type=int, default=10,
+                    help="minimum-duration threshold whose durations to use (0 for none)")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    subs = load_subjects(args.data_dir)
-    ids = subs["subject_id"].to_numpy()
-    P = load_transition_matrices(args.data_dir / "Individual_TransitionProbabilities_K7_original.xls", ids)
+    beh = load_behaviour(args.data_dir)
+    beh = beh[~beh.subject_id.isin(EXCLUDED)].reset_index(drop=True)
 
-    mu = np.vstack([stationary_distribution(P[i]) for i in range(len(ids))])
-    subject_level = pd.DataFrame({
-        "subject_id": ids,
-        "age": subs["age"].to_numpy(),
-        "sex": subs["sex"].to_numpy(),
-        "matrix_T": subs["matrix_T"].to_numpy(),
-        "matrix_raw": subs["matrix_raw"].to_numpy(),
-        "income": subs["income"].to_numpy(),
-        "equivalised_income": subs["equivalised_income"].to_numpy(),
-        "subjective_SES": subs["subjective_SES"].to_numpy(),
-        "T_samples": load_T(args.data_dir, ids),
-    })
-    for c in [c for c in subs.columns if c.startswith("SDQ_")]:
-        subject_level[c] = subs[c].to_numpy()
+    suffix = f"_thresh{args.threshold}" if args.threshold else ""
+    xi_sub = pd.read_csv(args.hmm_dir / "xi_subject_level.csv")
+    xi_state = pd.read_csv(args.hmm_dir / "xi_state_level.csv")
+    dur = pd.read_csv(args.hmm_dir / f"durations{suffix}.csv")
+    vpath_sub = pd.read_csv(args.hmm_dir / "vpath_subject_level.csv")
+    trans = pd.read_csv(args.hmm_dir / "xi_transition_matrices.csv")
+    for d in (xi_sub, xi_state, dur, vpath_sub, trans):
+        d["subject_id"] = d["subject_id"].astype(str)
 
-    subject_level["entropy_rate"] = [entropy_rate(P[i], mu[i], fs=FS_HZ) for i in range(len(ids))]
-    subject_level["entropy_rate_per_sample"] = [entropy_rate(P[i], mu[i]) for i in range(len(ids))]
-    diag = np.diagonal(P, axis1=1, axis2=2)
-    # Stationary-weighted probability of leaving the current state per sample.
-    subject_level["switching_rate"] = 1.0 - np.sum(mu * diag, axis=1)
-    subject_level["switching_rate_unweighted"] = 1.0 - diag.mean(axis=1)
-    subject_level["max_FO"] = mu.max(axis=1)
+    expected = set(beh.subject_id)
+    for name, d in [("xi_subject_level", xi_sub), ("durations", dur),
+                    ("vpath_subject_level", vpath_sub)]:
+        got = set(d.subject_id)
+        if got != expected:
+            raise ValueError(f"{name} covers {len(got)} participants, not the "
+                             f"{len(expected)} in the analysis sample; "
+                             f"missing {sorted(expected - got)}, extra {sorted(got - expected)}")
 
-    # Columns as reported in the original spreadsheet, for comparison.
-    subject_level["entropy_rate_original"] = subs["Entropy"].to_numpy()
-    subject_level["switching_rate_original"] = subs["SwitchingRate"].to_numpy()
-    subject_level["max_FO_original"] = subs["MaxFO"].to_numpy()
+    subject_level = (beh[["subject_id", "age", "sex", "matrix_T", "matrix_raw",
+                          "income", "equivalised_income", "subjective_SES"]
+                         + [c for c in beh.columns if c.startswith("SDQ_")]]
+                     .merge(xi_sub[["subject_id", "T_samples", "entropy_rate",
+                                    "entropy_rate_per_sample", "max_FO"]],
+                            on="subject_id", validate="one_to_one")
+                     .merge(vpath_sub[["subject_id", "n_switches", "switching_rate_vpath"]],
+                            on="subject_id", validate="one_to_one")
+                     .rename(columns={"switching_rate_vpath": "switching_rate"}))
 
-    state_level = pd.DataFrame([
-        {"subject_id": ids[i], "state": s + 1,
-         "FO": mu[i, s],
-         "FO_original": subs[f"FO{s + 1}"].to_numpy()[i],
-         "lifetime_mean": np.nan,
-         "interval_mean": np.nan}
-        for i in range(len(ids)) for s in range(NSTATES)
-    ])
+    # Columns as published from the earlier 40-participant fit, for provenance only.
+    orig = beh[["subject_id", "Entropy", "SwitchingRate", "MaxFO"]].rename(
+        columns={"Entropy": "entropy_rate_orig40", "SwitchingRate": "switching_rate_orig40",
+                 "MaxFO": "max_FO_orig40"})
+    subject_level = subject_level.merge(orig, on="subject_id", validate="one_to_one")
 
-    if args.durations:
-        dur = pd.read_csv(args.durations)
-        dur["subject_id"] = dur["subject_id"].astype(str)
-        state_level["subject_id"] = state_level["subject_id"].astype(str)
-        state_level = state_level.drop(columns=["lifetime_mean", "interval_mean"]).merge(
-            dur[["subject_id", "state", "n_visits", "lifetime_mean", "interval_mean",
-                 "lifetime_median", "interval_median", "FO_counted"]],
-            on=["subject_id", "state"], how="left", validate="one_to_one")
-        if state_level[["n_visits"]].isna().any().any():
-            raise ValueError("durations file does not cover every subject x state")
-
-    transitions = pd.DataFrame([
-        {"subject_id": ids[i], "from_state": f + 1, "to_state": t + 1, "probability": P[i, f, t]}
-        for i in range(len(ids)) for f in range(NSTATES) for t in range(NSTATES)
-    ])
+    state_level = (xi_state.rename(columns={"FO_stationary": "FO"})
+                   .merge(dur[["subject_id", "state", "n_visits", "FO_counted",
+                               "lifetime_mean", "lifetime_median",
+                               "interval_mean", "interval_median"]],
+                          on=["subject_id", "state"], validate="one_to_one"))
+    fo_orig = beh.melt(id_vars="subject_id", value_vars=[f"FO{s}" for s in range(1, NSTATES + 1)],
+                       var_name="state", value_name="FO_orig40")
+    fo_orig["state"] = fo_orig["state"].str.removeprefix("FO").astype(int)
+    state_level = state_level.merge(fo_orig, on=["subject_id", "state"], validate="one_to_one")
 
     for name, df in [("subject_level", subject_level), ("state_level", state_level),
-                     ("transition_matrices", transitions)]:
+                     ("transition_matrices", trans)]:
+        df = df.sort_values([c for c in ["subject_id", "state", "from_state", "to_state"]
+                             if c in df.columns])
         df.to_csv(args.out_dir / f"{name}.csv", index=False)
         print(f"wrote {name}.csv  {df.shape}")
+    print(f"analysis sample: n = {len(subject_level)}  (excluded: {', '.join(EXCLUDED)})")
 
 
 if __name__ == "__main__":

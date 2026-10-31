@@ -11,8 +11,12 @@ Subject-level HMM metrics are recomputed from the per-participant transition
 matrices rather than copied from the spreadsheet; the original columns are
 carried through alongside as *_original for comparison.
 
+Pass --durations to fill in the per-state lifetimes and intervals produced by
+compute_durations.py; without it those columns are left empty, since the
+duration files shipped with the original analysis carry no subject index.
+
 Usage:
-  python prepare_data.py --data-dir <dir> --out-dir <dir>
+  python prepare_data.py --data-dir <dir> --out-dir <dir> [--durations <csv>]
 """
 
 from __future__ import annotations
@@ -89,6 +93,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True, type=Path)
     ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--durations", type=Path,
+                    help="durations csv from compute_durations.py")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -128,12 +134,21 @@ def main() -> None:
         {"subject_id": ids[i], "state": s + 1,
          "FO": mu[i, s],
          "FO_original": subs[f"FO{s + 1}"].to_numpy()[i],
-         # Per-subject durations are not recoverable: LifetimesFull.csv and
-         # IntervalsFull.csv are state-major with no subject index.
          "lifetime_mean": np.nan,
          "interval_mean": np.nan}
         for i in range(len(ids)) for s in range(NSTATES)
     ])
+
+    if args.durations:
+        dur = pd.read_csv(args.durations)
+        dur["subject_id"] = dur["subject_id"].astype(str)
+        state_level["subject_id"] = state_level["subject_id"].astype(str)
+        state_level = state_level.drop(columns=["lifetime_mean", "interval_mean"]).merge(
+            dur[["subject_id", "state", "n_visits", "lifetime_mean", "interval_mean",
+                 "lifetime_median", "interval_median", "FO_counted"]],
+            on=["subject_id", "state"], how="left", validate="one_to_one")
+        if state_level[["n_visits"]].isna().any().any():
+            raise ValueError("durations file does not cover every subject x state")
 
     transitions = pd.DataFrame([
         {"subject_id": ids[i], "from_state": f + 1, "to_state": t + 1, "probability": P[i, f, t]}

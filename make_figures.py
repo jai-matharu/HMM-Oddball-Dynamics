@@ -172,19 +172,29 @@ def figure2_state_maps(merged, state_maps_npz, parcellation, output_dir, style):
         ijk = np.array(np.where(labels == top)).mean(axis=1)
         peaks.append(nib.affines.apply_affine(labels_img.affine, ijk))
 
-    vmax = float(np.nanmax(np.abs(np.concatenate(
-        [s[h] for s in surfaces for h in ("left", "right")]))))
+    # State 1 is an order of magnitude larger than the rest (its envelope is
+    # elevated everywhere, and it holds only ~2% of occupancy), so one shared
+    # scale would flatten states 2-7 to near-uniform colour. States 2-7 share a
+    # scale and are directly comparable; state 1 is drawn on its own scale and
+    # carries a separate colourbar, so its map is read for pattern, not magnitude.
+    def peak(indices):
+        return float(np.nanmax(np.abs(np.concatenate(
+            [surfaces[i][h] for i in indices for h in ("left", "right")]))))
+
+    vmax = peak(range(1, 7))
+    vmax_state1 = peak([0])
 
     views = [("left", "lateral"), ("left", "medial"), ("right", "lateral"), ("right", "medial")]
     fig, axes = plt.subplots(7, 4, figsize=(13.0, 20.0),
                              subplot_kw={"projection": "3d"})
     for k in range(7):
+        scale = vmax_state1 if k == 0 else vmax
         for c, (hemi, view) in enumerate(views):
             plot_surf_stat_map(
                 getattr(fsaverage, f"infl_{hemi}"), surfaces[k][hemi],
                 hemi=hemi, view=view, bg_map=getattr(fsaverage, f"sulc_{hemi}"),
-                cmap=style.DIVERGING_CMAP, vmax=vmax, threshold=0.02 * vmax,
-                colorbar=False, bg_on_data=True, darkness=None,
+                cmap=style.DIVERGING_CMAP, vmin=-scale, vmax=scale,
+                threshold=0.02 * scale, colorbar=False, bg_on_data=True,
                 axes=axes[k, c], figure=fig)
             axes[k, c].set_title("")
             if k == 0:
@@ -200,12 +210,16 @@ def figure2_state_maps(merged, state_maps_npz, parcellation, output_dir, style):
                           transform=axes[k, 3].transAxes, ha="left", va="center",
                           fontsize=10, color=style.TEXT_MUTED)
 
-    cax = fig.add_axes([0.35, 0.075, 0.3, 0.009])
-    norm = plt.Normalize(vmin=-vmax, vmax=vmax)
-    cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=style.DIVERGING_CMAP),
-                        cax=cax, orientation="horizontal")
-    cbar.set_label("Relative amplitude envelope (SD)", fontsize=13, fontweight="bold")
-    cbar.outline.set_visible(False)
+    for position, scale, label in (
+            ([0.20, 0.075, 0.25, 0.009], vmax_state1, "State 1 only (SD)"),
+            ([0.56, 0.075, 0.25, 0.009], vmax, "States 2-7 (SD)")):
+        cax = fig.add_axes(position)
+        norm = plt.Normalize(vmin=-scale, vmax=scale)
+        cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=style.DIVERGING_CMAP),
+                            cax=cax, orientation="horizontal")
+        cbar.set_label(f"Relative amplitude envelope, {label}",
+                       fontsize=11, fontweight="bold")
+        cbar.outline.set_visible(False)
     fig.subplots_adjust(left=0.05, right=0.90, top=0.97, bottom=0.10,
                         wspace=-0.10, hspace=-0.25)
     style.save_figure(fig, output_dir / "figure_2_state_maps")
@@ -258,21 +272,33 @@ def figure4_transitions(merged, trans, output_dir, style):
     pos = np.column_stack([np.cos(angles), np.sin(angles)])
     off = matrix.copy()
     np.fill_diagonal(off, 0.0)
-    threshold = np.percentile(off[off > 0], 50)
+    # Only the strongest 40% of edges are drawn, and width and opacity are scaled
+    # across the drawn range rather than across zero: the off-diagonals span a
+    # narrow band, so an absolute scale renders every edge at the same weight.
+    shown = off[off > 0]
+    threshold = np.percentile(shown, 60)
+    lo, hi = threshold, off.max()
     for i in range(7):
         for j in range(7):
             if i == j or off[i, j] < threshold:
                 continue
+            weight = (off[i, j] - lo) / (hi - lo) if hi > lo else 1.0
             start, end = pos[i], pos[j]
             d = end - start
             n = d / np.linalg.norm(d)
-            start = start + n * 0.13
-            end = end - n * 0.13
+            start = start + n * 0.15
+            end = end - n * 0.15
             ax.annotate("", xy=end, xytext=start,
-                        arrowprops=dict(arrowstyle="-|>", color=style.NEUTRAL_GREY,
-                                        linewidth=0.4 + 7.0 * off[i, j],
-                                        alpha=0.75, shrinkA=0, shrinkB=0,
+                        arrowprops=dict(arrowstyle="-|>,head_width=0.22,head_length=0.45",
+                                        color=style.TEXT_SECONDARY,
+                                        linewidth=0.6 + 3.4 * weight,
+                                        alpha=0.30 + 0.60 * weight,
+                                        shrinkA=0, shrinkB=0,
                                         connectionstyle="arc3,rad=0.16"))
+    ax.text(0.5, -0.02, f"strongest 40% of between-state transitions "
+                        f"({lo:.3f}-{hi:.3f})",
+            transform=ax.transAxes, ha="center", va="top",
+            fontsize=10, color=style.TEXT_MUTED)
     for i in range(7):
         ax.scatter(*pos[i], s=300 + 5200 * occupancy[i], color=palette[i],
                    edgecolor=style.TEXT_PRIMARY, linewidth=0.8, zorder=5)
@@ -336,9 +362,12 @@ def figure6_terms(terms, output_dir, style, predictor_label):
             ax.scatter(row.t, y, s=175, facecolor="none", edgecolor=style.TEXT_PRIMARY,
                        linewidth=0.9, zorder=3)
 
-    labels = [f"{MEASURE_LABELS[r.measure]}" + (f"  ·  state {r.state[-1]}"
+    scalar_labels = {"measure": predictor_label, "age": "age",
+                     "age_x_measure": f"age \u00d7 {predictor_label}"}
+    labels = [f"{MEASURE_LABELS[r.measure]}" + (f"  \u00b7  state {r.state[-1]}"
               if isinstance(r.state, str) and r.state.startswith("state")
-              else f"  ·  {r.state}") for r in t.itertuples()]
+              else f"  \u00b7  {scalar_labels.get(r.state, r.state)}")
+              for r in t.itertuples()]
     ax.set_yticks(ypos, labels, fontsize=10)
     style.reference_line(ax, 0, axis="x")
     ax.set_xlabel(f"t  ({predictor_label})")
@@ -352,7 +381,7 @@ def figure6_terms(terms, output_dir, style, predictor_label):
         Line2D([], [], marker="o", linestyle="none", markersize=13,
                markerfacecolor="none", markeredgecolor=style.TEXT_PRIMARY,
                label="Westfall-Young step-down significant")],
-        loc="lower right", fontsize=10)
+        loc="upper center", bbox_to_anchor=(0.5, -0.055), ncol=2, fontsize=10)
     fig.tight_layout()
     style.save_figure(fig, output_dir / "figure_6_term_overview")
     plt.close(fig)

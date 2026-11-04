@@ -383,7 +383,163 @@ def figure6_terms(terms, output_dir, style, predictor_label):
                label="Westfall-Young step-down significant")],
         loc="upper center", bbox_to_anchor=(0.5, -0.055), ncol=2, fontsize=10)
     fig.tight_layout()
-    style.save_figure(fig, output_dir / "figure_6_term_overview")
+    style.save_figure(fig, output_dir / "figure_8_term_overview")
+    plt.close(fig)
+
+
+def figure5_externalising_effects(merged, terms, output_dir, style, predictor, predictor_label):
+    """The headline finding: paired occupancy and entry effects, and their sign structure."""
+    style.apply_style()
+    palette = style.state_palette(7)
+    fig = plt.figure(figsize=(13.0, 9.0))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.05], hspace=0.38, wspace=0.28)
+
+    # A: t per state for the two compositional measures, paired within state.
+    ax = fig.add_subplot(gs[0, :])
+    look = terms.set_index("term")
+    width = 0.19
+    for s_no in ALL_STATES:
+        for offset, metric, marker in ((-width, "FO", "o"),
+                                       (+width, "transition_into_sum", "s")):
+            row = look.loc[f"{metric}|state{s_no}"]
+            ax.plot([s_no + offset, s_no + offset], [0, row.t],
+                    color=palette[s_no - 1], linewidth=2.0, alpha=0.8, zorder=2)
+            ax.scatter(s_no + offset, row.t, marker=marker,
+                       s=95 if row.bh_significant else 48,
+                       color=palette[s_no - 1], edgecolor=style.TEXT_PRIMARY,
+                       linewidth=1.2 if row.bh_significant else 0.4, zorder=4)
+    style.reference_line(ax, 0, axis="y")
+    ax.set_xticks(ALL_STATES, [f"State {s}" for s in ALL_STATES])
+    ax.set_ylabel(f"t  ({predictor_label})")
+    ax.set_title("A", loc="left", fontsize=16, fontweight="bold")
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[
+        Line2D([], [], marker="o", linestyle="none", markersize=9,
+               markerfacecolor=style.NEUTRAL_GREY, markeredgecolor=style.TEXT_PRIMARY,
+               label="Fractional occupancy"),
+        Line2D([], [], marker="s", linestyle="none", markersize=9,
+               markerfacecolor=style.NEUTRAL_GREY, markeredgecolor=style.TEXT_PRIMARY,
+               label="Transitions into state")],
+        loc="upper left", ncol=2, fontsize=11)
+
+    # B: the three strongest states, occupancy against the measure.
+    strongest = (look[(look.measure == "FO") & look.bh_significant]
+                 .reindex(look[(look.measure == "FO") & look.bh_significant]
+                          .t.abs().sort_values(ascending=False).index)
+                 .head(3))
+    for i, term in enumerate(strongest.index):
+        s_no = int(term[-1])
+        axb = fig.add_subplot(gs[1, i])
+        sub = merged[merged["state"] == s_no]
+        scatter(axb, sub[predictor].to_numpy(), sub["FO"].to_numpy(),
+                predictor_label, "Fractional occupancy", palette[s_no - 1], style)
+        row = look.loc[term]
+        axb.set_title(f"State {s_no}   t = {row.t:+.2f}, $p_{{BH}}$ = {row.bh_p:.4f}",
+                      fontsize=13)
+        if i == 0:
+            axb.text(-0.22, 1.06, "B", transform=axb.transAxes,
+                     fontsize=16, fontweight="bold")
+    style.save_figure(fig, output_dir / "figure_5_externalising_effects")
+    plt.close(fig)
+
+
+def figure6_subject_level(subject, scalars, entropy_adjusted, output_dir, style,
+                          predictor, predictor_label):
+    """Subject-level summaries against the measure."""
+    style.apply_style()
+    look = scalars[scalars.term == "measure"].set_index("outcome")
+    panels = [("entropy_rate", "Entropy rate (nats/s)", "A"),
+              ("switching_rate", "Switching rate", "B"),
+              ("max_FO", "Maximum fractional occupancy", "C")]
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.8))
+    for ax, (col, label, letter) in zip(axes, panels):
+        scatter(ax, subject[predictor].to_numpy(), subject[col].to_numpy(),
+                predictor_label, label, style.NEUTRAL_LIGHT_BLUE, style)
+        row = look.loc[col]
+        ax.set_title(f"{letter}    t = {row.t:+.2f}, p = {row.perm_p:.3f}",
+                     loc="left", fontsize=14, fontweight="bold")
+        # Only entropy rate belongs to the corrected family; quoting an
+        # uncorrected p alone would overstate the other two.
+        note = (f"adjusted p = {entropy_adjusted:.3f}" if col == "entropy_rate"
+                else "outside the correction family")
+        ax.text(0.0, -0.30, note, transform=ax.transAxes, fontsize=11,
+                color=style.TEXT_MUTED)
+    fig.subplots_adjust(bottom=0.26, wspace=0.30)
+    style.save_figure(fig, output_dir / "figure_6_subject_level_summaries")
+    plt.close(fig)
+
+
+def figure7_specificity(models_dir, output_dir, style, questions):
+    """The externalising-significant terms, shown for all three questions."""
+    style.apply_style()
+    palette = style.state_palette(7)
+    tables = {q: pd.read_csv(models_dir / f"terms_{q}.csv").set_index("term")
+              for q, _ in questions}
+    primary = tables[questions[0][0]]
+    sig = primary[primary.bh_significant]
+    sig = sig.reindex(sig.t.abs().sort_values().index)
+
+    fig, ax = plt.subplots(figsize=(10.0, 8.0))
+    ypos = np.arange(len(sig))
+    markers = ["o", "^", "D"]
+    for j, (q, label) in enumerate(questions):
+        t = tables[q].reindex(sig.index)
+        colours = [palette[int(st[-1]) - 1] if isinstance(st, str) and st.startswith("state")
+                   else style.NEUTRAL_GREY for st in t.state]
+        edge = [style.TEXT_PRIMARY if s else style.NEUTRAL_GREY for s in t.bh_significant]
+        ax.scatter(t.t, ypos + (j - 1) * 0.24, marker=markers[j],
+                   s=[85 if s else 42 for s in t.bh_significant],
+                   color=colours if j == 0 else "white",
+                   edgecolor=colours if j else edge,
+                   linewidth=1.4 if j else 1.0, zorder=4)
+    style.reference_line(ax, 0, axis="x")
+    labels = [f"{MEASURE_LABELS[r.measure]}  \u00b7  state {r.state[-1]}"
+              if isinstance(r.state, str) and r.state.startswith("state")
+              else f"{MEASURE_LABELS[r.measure]}" for r in sig.itertuples()]
+    ax.set_yticks(ypos, labels, fontsize=10)
+    ax.set_xlabel("t")
+    ax.set_ylim(-0.8, len(sig) - 0.2)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], marker=m, linestyle="none", markersize=9,
+                      markerfacecolor=style.NEUTRAL_GREY if j == 0 else "white",
+                      markeredgecolor=style.TEXT_PRIMARY, label=lab)
+               for j, (m, (_, lab)) in enumerate(zip(markers, questions))]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.08),
+              ncol=3, fontsize=11)
+    fig.tight_layout()
+    style.save_figure(fig, output_dir / "figure_7_specificity")
+    plt.close(fig)
+
+
+def figure_s5_correction(models_dir, output_dir, style):
+    """Adjusted p under each correction scheme, for the primary question."""
+    style.apply_style()
+    fs = pd.read_csv(models_dir / "family_sensitivity.csv")
+    e = fs[fs.question == "SDQ_externalising"].copy()
+    e = e.reindex(e.perm_p.sort_values(ascending=False).index)
+    schemes = [("bh_question", "BH, per question (31)", "o"),
+               ("bh_measure", "BH, per measure", "s"),
+               ("bh_pooled", "BH, all pooled (93)", "^"),
+               ("wy_step_down", "Westfall-Young step-down", "D")]
+    fig, ax = plt.subplots(figsize=(9.5, 11.0))
+    ypos = np.arange(len(e))
+    colours = [style.COLORS["blue"], style.COLORS["orange"],
+               style.COLORS["bluish_green"], style.COLORS["reddish_purple"]]
+    for (col, label, marker), colour in zip(schemes, colours):
+        ax.scatter(e[col].clip(lower=1e-4), ypos, marker=marker, s=46, color=colour,
+                   edgecolor=style.TEXT_PRIMARY, linewidth=0.3, label=label, zorder=4)
+    ax.axvline(0.05, color=style.TEXT_PRIMARY, linestyle="--", linewidth=0.9, zorder=2)
+    ax.set_xscale("log")
+    ax.set_xlabel("Adjusted $p$")
+    labels = [f"{MEASURE_LABELS[r.measure]}  \u00b7  state {r.state[-1]}"
+              if isinstance(r.state, str) and r.state.startswith("state")
+              else f"{MEASURE_LABELS[r.measure]}  \u00b7  {str(r.state).replace('_', ' ')}"
+              for r in e.itertuples()]
+    ax.set_yticks(ypos, labels, fontsize=9)
+    ax.set_ylim(-1, len(e))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.05), ncol=2, fontsize=10)
+    fig.tight_layout()
+    style.save_figure(fig, output_dir / "figure_S5_correction_sensitivity")
     plt.close(fig)
 
 
@@ -419,12 +575,32 @@ def main() -> None:
     fo_states = sorted(int(s[-1]) for s in sig.loc[sig.measure == "FO", "state"])
     tr_states = sorted(int(s[-1]) for s in
                        sig.loc[sig.measure == "transition_into_sum", "state"])
+    figure5_externalising_effects(merged, terms, args.output_dir, style,
+                                  args.predictor, args.predictor_label)
+    print("figure 5 done", flush=True)
+
+    scalars_path = args.models_dir / f"subject_scalars_{args.predictor}.csv"
+    if scalars_path.exists():
+        entropy_adjusted = float(
+            terms.loc[terms.term == "entropy_rate|measure", "bh_p"].iloc[0])
+        figure6_subject_level(subject, pd.read_csv(scalars_path), entropy_adjusted,
+                              args.output_dir, style, args.predictor, args.predictor_label)
+        print("figure 6 done", flush=True)
+    else:
+        print(f"figure 6 skipped: {scalars_path} not found", flush=True)
+
+    figure7_specificity(args.models_dir, args.output_dir, style,
+                        [("SDQ_externalising", "Externalising"),
+                         ("SDQ_internalising", "Internalising"),
+                         ("matrix_T", "Matrix reasoning")])
+    print("figure 7 done", flush=True)
+    figure6_terms(terms, args.output_dir, style, args.predictor_label)
+    figure_s5_correction(args.models_dir, args.output_dir, style)
+    print("figure 8 and S5 done", flush=True)
+
     state_scatter_grid(merged, fo_states, "FO", "Fractional occupancy",
                        args.predictor, args.predictor_label,
-                       "figure_5_occupancy_externalising", args.output_dir, style)
-    print("figure 5 done", flush=True)
-    figure6_terms(terms, args.output_dir, style, args.predictor_label)
-    print("figure 6 done", flush=True)
+                       "figure_S6_occupancy_significant_states", args.output_dir, style)
 
     state_scatter_grid(merged, ALL_STATES, "FO", "Fractional occupancy",
                        args.predictor, args.predictor_label,

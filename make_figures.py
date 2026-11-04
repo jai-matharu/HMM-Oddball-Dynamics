@@ -8,8 +8,11 @@ State spatial maps are rebuilt here from the 39-participant fit, because none
 exist for it. The fit used `onpower = 1`, `order = 0`, `zeromean = 0` and
 `standardise = 1`, so a state's observation model mean is a per-parcel amplitude
 envelope in units of SD. Maps show each state's mean minus the occupancy-weighted
-mean across states, i.e. relative power, which is the quantity that distinguishes
-states from one another rather than the overall envelope level.
+mean across states and then minus its own spatial mean, i.e. where that state's
+envelope runs high or low across the cortex. The offset removed by the second
+step is printed beside each state, since for states 1, 3 and 6 it is the larger
+part of the contrast: their envelopes are shifted in one direction at every
+parcel, and without the demeaning their maps are a single flat colour.
 """
 
 from __future__ import annotations
@@ -143,85 +146,111 @@ def figure1_correlations(subject, output_dir, style):
 
 def figure2_state_maps(merged, state_maps_npz, parcellation, output_dir, style):
     """Relative amplitude-envelope maps for the seven states, on an inflated surface."""
+    from matplotlib.colors import LinearSegmentedColormap
     from nilearn import datasets, image, surface
     from nilearn.plotting import plot_surf_stat_map
     import nibabel as nib
+
+    # FSL's blue-lightblue / red-yellow pair, the convention these maps are read
+    # in. It saturates at both ends and runs dark next to the threshold, so a
+    # supra-threshold region reads as a region instead of fading into the grey.
+    cold_hot = LinearSegmentedColormap.from_list("cold_hot", [
+        (0.00, "#33ffff"), (0.22, "#0099ff"), (0.47, "#000c7a"),
+        (0.53, "#7a0000"), (0.78, "#ff6600"), (1.00, "#ffff33")])
+    threshold_fraction = 0.35      # of each state's own scale
+    scale_percentile = 98.0        # saturate the top 2% of vertices
 
     style.apply_style()
     maps = np.load(state_maps_npz)["mean"]                    # 7 x 38
     fo = merged.groupby("state")["FO"].mean().reindex(ALL_STATES).to_numpy()
     relative = maps - np.average(maps, axis=0, weights=fo)     # occupancy-weighted contrast
+    offsets = relative.mean(axis=1)                            # each state's global shift
+    pattern = relative - offsets[:, None]
 
     labels_img = nib.load(parcellation)
     labels = labels_img.get_fdata().astype(int)
-    fsaverage = datasets.fetch_surf_fsaverage("fsaverage5")
+    fsaverage = datasets.fetch_surf_fsaverage("fsaverage")     # 164k vertices per hemisphere
 
     # Project each state's parcel values into the volume, then onto the surface.
+    # Sampling between the white and pial meshes follows the cortical ribbon, so
+    # the 8 mm parcel grid reaches the surface without gaps.
     surfaces, peaks = [], []
     for k in range(7):
         vol = np.zeros(labels.shape, dtype=float)
         for parcel in range(1, 39):
-            vol[labels == parcel] = relative[k, parcel - 1]
-        img = nib.Nifti1Image(vol, labels_img.affine)
-        img = image.smooth_img(img, 6)
+            vol[labels == parcel] = pattern[k, parcel - 1]
+        img = image.smooth_img(nib.Nifti1Image(vol, labels_img.affine), 4)
         surfaces.append({
             hemi: surface.vol_to_surf(img, getattr(fsaverage, f"pial_{hemi}"),
-                                      interpolation="linear", radius=6.0)
+                                      inner_mesh=getattr(fsaverage, f"white_{hemi}"),
+                                      interpolation="linear")
             for hemi in ("left", "right")})
-        top = int(np.argmax(np.abs(relative[k]))) + 1
+        top = int(np.argmax(np.abs(pattern[k]))) + 1
         ijk = np.array(np.where(labels == top)).mean(axis=1)
         peaks.append(nib.affines.apply_affine(labels_img.affine, ijk))
 
-    # State 1 is an order of magnitude larger than the rest (its envelope is
-    # elevated everywhere, and it holds only ~2% of occupancy), so one shared
-    # scale would flatten states 2-7 to near-uniform colour. States 2-7 share a
-    # scale and are directly comparable; state 1 is drawn on its own scale and
-    # carries a separate colourbar, so its map is read for pattern, not magnitude.
-    def peak(indices):
-        return float(np.nanmax(np.abs(np.concatenate(
-            [surfaces[i][h] for i in indices for h in ("left", "right")]))))
+    # Binarised curvature, as FreeSurfer and Workbench draw it: two flat greys
+    # under the data rather than continuous shading through it, so the colour is
+    # not dimmed by whatever happens to lie beneath it.
+    background = {}
+    for hemi in ("left", "right"):
+        curv = surface.load_surf_data(getattr(fsaverage, f"curv_{hemi}"))
+        background[hemi] = np.where(curv > 0, 0.35, 0.65)
 
-    vmax = peak(range(1, 7))
-    vmax_state1 = peak([0])
-
-    views = [("left", "lateral"), ("left", "medial"), ("right", "lateral"), ("right", "medial")]
-    fig, axes = plt.subplots(7, 4, figsize=(13.0, 20.0),
+    # Every state carries its own scale and its own colourbar. A shared scale
+    # would put states 3 and 6 (spatial SD 0.045 and 0.036) near the middle of a
+    # range set by state 1 (0.230) and leave them almost uncoloured.
+    views = [("left", "lateral"), ("left", "medial"),
+             ("right", "medial"), ("right", "lateral")]
+    palette = style.state_palette(7)
+    fig, axes = plt.subplots(7, 4, figsize=(13.0, 17.0),
                              subplot_kw={"projection": "3d"})
+    scales = []
     for k in range(7):
-        scale = vmax_state1 if k == 0 else vmax
+        values = np.concatenate([surfaces[k][h] for h in ("left", "right")])
+        scale = float(np.percentile(np.abs(values), scale_percentile))
+        scales.append(scale)
         for c, (hemi, view) in enumerate(views):
             plot_surf_stat_map(
                 getattr(fsaverage, f"infl_{hemi}"), surfaces[k][hemi],
-                hemi=hemi, view=view, bg_map=getattr(fsaverage, f"sulc_{hemi}"),
-                cmap=style.DIVERGING_CMAP, vmin=-scale, vmax=scale,
-                threshold=0.02 * scale, colorbar=False, bg_on_data=True,
-                axes=axes[k, c], figure=fig)
+                hemi=hemi, view=view, bg_map=background[hemi], cmap=cold_hot,
+                vmin=-scale, vmax=scale, threshold=threshold_fraction * scale,
+                colorbar=False, bg_on_data=False, axes=axes[k, c], figure=fig)
             axes[k, c].set_title("")
             if k == 0:
                 axes[k, c].set_title(f"{hemi.capitalize()} {view}", fontsize=12,
                                      fontweight="bold", pad=0)
         x, y, z = peaks[k]
-        axes[k, 0].text2D(-0.08, 0.5, f"State {k + 1}", transform=axes[k, 0].transAxes,
+        axes[k, 0].text2D(-0.17, 0.5, f"State {k + 1}", transform=axes[k, 0].transAxes,
                           rotation=90, ha="center", va="center",
-                          fontsize=15, fontweight="bold",
-                          color=style.state_palette(7)[k])
-        axes[k, 3].text2D(1.02, 0.5,
-                          f"peak parcel\n({x:.0f}, {y:.0f}, {z:.0f})\nFO {fo[k]:.3f}",
-                          transform=axes[k, 3].transAxes, ha="left", va="center",
-                          fontsize=10, color=style.TEXT_MUTED)
+                          fontsize=15, fontweight="bold", color=palette[k])
+        axes[k, 0].text2D(-0.04, 0.5,
+                          f"FO {fo[k]:.3f}\noffset {offsets[k]:+.2f} SD\n"
+                          f"peak ({x:.0f}, {y:.0f}, {z:.0f})",
+                          transform=axes[k, 0].transAxes, rotation=90,
+                          ha="center", va="center", fontsize=9,
+                          color=style.TEXT_MUTED)
 
-    for position, scale, label in (
-            ([0.20, 0.075, 0.25, 0.009], vmax_state1, "State 1 only (SD)"),
-            ([0.56, 0.075, 0.25, 0.009], vmax, "States 2-7 (SD)")):
-        cax = fig.add_axes(position)
-        norm = plt.Normalize(vmin=-scale, vmax=scale)
-        cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=style.DIVERGING_CMAP),
-                            cax=cax, orientation="horizontal")
-        cbar.set_label(f"Relative amplitude envelope, {label}",
-                       fontsize=11, fontweight="bold")
+    fig.subplots_adjust(left=0.11, right=0.88, top=0.96, bottom=0.015,
+                        wspace=-0.10, hspace=-0.30)
+    for k in range(7):
+        box = axes[k, 3].get_position()
+        cax = fig.add_axes([0.90, box.y0 + 0.30 * box.height, 0.010, 0.40 * box.height])
+        norm = plt.Normalize(vmin=-scales[k], vmax=scales[k])
+        cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cold_hot), cax=cax)
+        cbar.set_ticks([-scales[k], 0.0, scales[k]])
+        cbar.set_ticklabels([f"{-scales[k]:.2f}", "0", f"{scales[k]:+.2f}"])
+        cbar.ax.tick_params(labelsize=8, length=2)
         cbar.outline.set_visible(False)
-    fig.subplots_adjust(left=0.05, right=0.90, top=0.97, bottom=0.10,
-                        wspace=-0.10, hspace=-0.25)
+    fig.text(0.965, 0.5, "Relative amplitude envelope (SD)", rotation=90,
+             ha="center", va="center", fontsize=11, fontweight="bold")
+    # A 164k-vertex mesh is ~330k triangles per panel, which as vector paths
+    # would make the PDF several hundred megabytes. The meshes are rasterised at
+    # 300 dpi; the labels, ticks and colourbars stay vector.
+    for ax in axes.ravel():
+        for collection in ax.collections:
+            collection.set_rasterized(True)
+    fig.set_dpi(300)
     style.save_figure(fig, output_dir / "figure_2_state_maps")
     plt.close(fig)
 

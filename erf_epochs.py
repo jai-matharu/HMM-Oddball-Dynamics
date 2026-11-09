@@ -36,14 +36,20 @@ CONDITIONS = ("Standard", "Deviant1", "Deviant2")
 
 
 def read_epochs(path: Path) -> pd.DataFrame:
-    """Labels, onsets and bad flags for one epoched SPM MEEG file."""
+    """Index, label, onset and bad flag for each trial of one epoched SPM MEEG file.
+
+    The index is the trial's position in the `.dat`, kept because an onset does not
+    identify a trial: seven phantoms are quantised onto the same 4 ms sample as the
+    standard they shadow, which is incidentally a further sign that they are not sounds.
+    """
     D = loadmat(str(path), squeeze_me=True, struct_as_record=False)["D"]
     trials = np.atleast_1d(D.trials)
     return pd.DataFrame({
+        "trial": np.arange(len(trials)),
         "label": [str(t.label) for t in trials],
         "onset": [float(t.onset) for t in trials],
         "bad": [int(getattr(t, "bad", 0)) for t in trials],
-    }).sort_values("onset", ignore_index=True)
+    }).sort_values(["onset", "label"], kind="stable", ignore_index=True)
 
 
 def chain_standards(onsets: np.ndarray, period: float, tol: float = 0.020,
@@ -131,8 +137,8 @@ def place_on_lattice(onsets: np.ndarray, period: float, bounds: np.ndarray,
     return block, index.astype(int), onsets - (phases[block] + index * period)
 
 
-def flag_spurious(block: np.ndarray, index: np.ndarray, residual: np.ndarray,
-                  tolerance: float) -> np.ndarray:
+def flag_spurious(labels: np.ndarray, block: np.ndarray, index: np.ndarray,
+                  residual: np.ndarray, tolerance: float) -> np.ndarray:
     """Mark the epochs that cannot be real stimuli.
 
     A beat carries one stimulus, so a second epoch on a beat another already occupies is
@@ -140,9 +146,15 @@ def flag_spurious(block: np.ndarray, index: np.ndarray, residual: np.ndarray,
     catches the phantoms that fall near enough to a beat to pass the distance test on
     their own: their lag behind the standard they shadow runs from a few milliseconds to
     about fifty, so distance alone would let the earliest of them through.
+
+    Seven phantoms share their standard's sample exactly, so the two are equidistant from
+    the beat and distance cannot choose between them. `Deviant2` loses that tie, because
+    the surplus epochs are `Deviant2` in all five affected recordings while the `Standard`
+    count is at design in all forty. Stating the rule beats leaving it to the sort's
+    tie-breaking, which happens to decide the same way.
     """
     spurious = np.abs(residual) > tolerance
-    order = np.lexsort((np.abs(residual), index, block))
+    order = np.lexsort((labels == "Deviant2", np.abs(residual), index, block))
     beat = np.column_stack([block, index])[order]
     duplicate = np.r_[False, (beat[1:] == beat[:-1]).all(axis=1)]
     spurious[order[duplicate]] = True
@@ -204,7 +216,7 @@ def main() -> None:
         block, index, residual = place_on_lattice(epochs.onset.to_numpy(), period,
                                                   bounds, phases)
         labels = epochs.label.to_numpy()
-        spurious = flag_spurious(block, index, residual, args.tolerance)
+        spurious = flag_spurious(labels, block, index, residual, args.tolerance)
         crowded = flag_crowded_deviants(labels, block, index, spurious)
         epochs = epochs.assign(subject_id=sid, block=block, beat=index, residual=residual,
                                off_beat=spurious, spurious=crowded,

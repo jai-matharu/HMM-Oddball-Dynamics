@@ -4,7 +4,8 @@ One row per window defined in 11d/11e: the grand-average waveforms of the two co
 over the cluster's sensors (mean +/- SEM across participants, cluster span shaded), and the
 topography of t averaged over the cluster's samples with the cluster's sensors marked.
 Gradiometer pairs are combined by root-mean-square, so their maps show |t|. A last panel
-gives t for every term of the five 11f families, with the BH-significant terms outlined.
+gives t for every term of the five 11f runs, outlining the terms significant under one BH
+correction across all of them.
 
 Reads the averages in physical units written by `erf_rescale.py` (fT, fT/mm), and the
 cluster and model outputs of the run on those averages.
@@ -182,16 +183,24 @@ def main() -> None:
     # --- the 155 association tests --------------------------------------------------
     terms = [f"{m}|state{s}" for m, _ in MEASURES for s in range(1, 8)]
     terms += [t for t, _ in ENTROPY]
-    matrix, significant, row_labels = [], [], []
+    # The ERF-HMM question is one correction family: BH across every term of every window.
+    from analysis.correction import correct_pvalues
+
+    matrix, pvalues, row_labels = [], [], []
     for position, w in enumerate(windows):
         start, end = w["row"].start_ms, w["row"].end_ms
         stem = f"erf_{w['channel_type']}_{w['contrast'].replace('Standard', 'S').replace('Deviant', 'D').replace('-', 'v')}_{start:.0f}_{end:.0f}"
         frame = pd.read_csv(args.models_dir / f"terms_{stem}.csv").set_index("term")
         matrix.append(frame.loc[terms, "t"].to_numpy())
-        significant.append(frame.loc[terms, "bh_significant"].to_numpy())
+        pvalues.append(frame.loc[terms, "perm_p"].to_numpy())
         letter = letters[position]
         row_labels.append(f"{letter}  {start:.0f}–{end:.0f} ms")
-    matrix, significant = np.array(matrix), np.array(significant)
+    matrix, pvalues = np.array(matrix), np.array(pvalues)
+    keys = [f"{r}::{c}" for r in range(matrix.shape[0]) for c in range(matrix.shape[1])]
+    pooled = correct_pvalues(dict(zip(keys, pvalues.ravel()))).set_index("term")
+    significant = pooled.loc[keys, "significant"].to_numpy(bool).reshape(matrix.shape)
+    print(f"pooled BH over {len(keys)} terms: {int(significant.sum())} significant, "
+          f"smallest adjusted p {pooled.p_adjusted.min():.4f}")
 
     ax = fig.add_subplot(grid[n + 1, :])
     limit = float(np.ceil(np.abs(matrix).max()))

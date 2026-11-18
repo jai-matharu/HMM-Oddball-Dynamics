@@ -231,6 +231,11 @@ def figure2_state_maps(merged, state_maps_npz, parcellation, output_dir, style):
                           ha="center", va="center", fontsize=9,
                           color=style.TEXT_MUTED)
 
+    # The negative spacing overlaps neighbouring panels; with opaque backgrounds,
+    # each panel painted over the right edge of the brain to its left.
+    for ax in axes.ravel():
+        ax.set_facecolor("none")
+        ax.patch.set_visible(False)
     fig.subplots_adjust(left=0.11, right=0.88, top=0.96, bottom=0.015,
                         wspace=-0.10, hspace=-0.30)
     for k in range(7):
